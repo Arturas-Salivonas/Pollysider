@@ -20,21 +20,22 @@ interface TradesState {
   setConnected: (connected: boolean) => void;
   updateFilters: (filters: Partial<FilterConfig>) => void;
   clearTrades: () => void;
+  cleanupOldTrades: () => void; // NEW: Periodic cleanup
   
   // Computed
   getFilteredTrades: () => EnrichedTrade[];
 }
 
 const DEFAULT_FILTERS: FilterConfig = {
-  minTradeSize: 1000, // Lowered from 5000 to see more trades
+  minTradeSize: 100, // Lowered to $100 to capture more trades
   maxWalletAge: 50000, // Very high default to show all wallets
   minConfidence: 'LOW',
   showOnlySuspicious: false,
   tradeSide: 'ALL' // Changed back to ALL so trades show up
 };
 
-const MAX_TRADES_IN_MEMORY = 1500; // Increased from 500 to keep trades 3x longer
-const TRADE_EXPIRY_MS = 30 * 60 * 1000; // 30 minutes (3x longer than before)
+const MAX_TRADES_IN_MEMORY = 500; // Keep last 500 trades
+const TRADE_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours (don't expire too quickly)
 
 export const useTradesStore = create<TradesState>()(
   persist(
@@ -46,22 +47,25 @@ export const useTradesStore = create<TradesState>()(
 
       addTrade: (trade) =>
         set((state) => {
-          // Don't add duplicate trades
+          // Don't add duplicate trades (shouldn't happen with backend dedup, but safety check)
           const isDuplicate = state.allTrades.some(t => t.id === trade.id);
           if (isDuplicate) {
             return state;
           }
           
+          // ✅ STORE EVERYTHING - Let filters work at display time only
+          
           // Remove trades older than TRADE_EXPIRY_MS
           const now = Date.now();
           const filteredTrades = state.allTrades.filter(t => {
-            // FIX: trade.timestamp is in SECONDS, not milliseconds
             const tradeTime = t.trade.timestamp * 1000;
             return (now - tradeTime) < TRADE_EXPIRY_MS;
           });
           
+          const newTrades = [trade, ...filteredTrades].slice(0, MAX_TRADES_IN_MEMORY);
+          
           return {
-            allTrades: [trade, ...filteredTrades].slice(0, MAX_TRADES_IN_MEMORY)
+            allTrades: newTrades
           };
         }),
 
@@ -74,10 +78,32 @@ export const useTradesStore = create<TradesState>()(
       updateFilters: (newFilters) =>
         set((state) => ({
           filters: { ...state.filters, ...newFilters }
+          // Don't delete trades - let getFilteredTrades() handle display filtering
         })),
 
       clearTrades: () =>
         set({ allTrades: [] }),
+      
+      // Periodic cleanup - call this every 5 minutes to flush old/filtered trades
+      cleanupOldTrades: () =>
+        set((state) => {
+          const now = Date.now();
+          
+          const cleanedTrades = state.allTrades.filter(t => {
+            // Only remove if expired (older than 24h)
+            const tradeTime = t.trade.timestamp * 1000;
+            return (now - tradeTime) < TRADE_EXPIRY_MS;
+          });
+          
+          const removedCount = state.allTrades.length - cleanedTrades.length;
+          if (removedCount > 0) {
+            console.log(`🧹 Cleaned up ${removedCount} old trades (${cleanedTrades.length} remaining)`);
+          }
+          
+          return {
+            allTrades: cleanedTrades
+          };
+        }),
 
       getFilteredTrades: () => {
         const { allTrades, filters } = get();

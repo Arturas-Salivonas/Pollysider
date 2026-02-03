@@ -49,8 +49,8 @@ export const FilterPanel: React.FC = () => {
             value={minTradeSize}
             onChange={(e) => handleMinTradeSizeChange(e.target.value)}
             className="bg-dark-bg border border-dark-border text-white px-3 py-1 rounded font-mono text-sm w-32"
-            placeholder="1000"
-            step="1000"
+            placeholder="100"
+            step="100"
           />
           <span className="text-xs text-dark-text-dim">USD</span>
         </div>

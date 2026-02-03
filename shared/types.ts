@@ -131,6 +131,7 @@ export interface SystemStats {
   connectedClients: number;
   uptime: number;             // Seconds
   lastTradeAt: Date | null;
+  lastPolymarketTradeAt?: Date | null; // NEW: When we last got data from Polymarket
 }
 
 // ============================================================================

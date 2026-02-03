@@ -9,7 +9,7 @@ import express from 'express';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
 import cors from 'cors';
-import dotenv from 'dotenv';
+import { config as dotenvConfig } from 'dotenv';
 import { PolymarketClient } from './websocket/polymarket-client';
 import { WalletAnalyzer } from './profiler/wallet-analyzer';
 import { InsiderDetector } from './detector/insider-detector';
@@ -21,8 +21,8 @@ import type {
   ClientMessage
 } from '../../shared/types';
 
-// Load environment variables
-dotenv.config();
+// Load environment variables (fix deprecation warning)
+dotenvConfig();
 
 // Configuration
 const PORT = process.env.PORT || 3001;
@@ -62,21 +62,65 @@ const stats: SystemStats = {
 };
 
 const startTime = Date.now();
+let lastPolymarketTradeTime: Date | null = null;
+let emittedToFrontend = 0;
+
+// Track processed trades to prevent duplicates
+const processedTradeIds = new Set<string>();
+const MAX_PROCESSED_HISTORY = 10000;
+
+// Queue to prevent parallel processing overwhelming APIs
+let processingQueue = Promise.resolve();
 
 /**
  * Process incoming trade from Polymarket
  */
 async function processTrade(trade: PolymarketTrade): Promise<void> {
   try {
+    // Track last trade time from Polymarket
+    lastPolymarketTradeTime = new Date();
+    
+    // Generate trade ID
+    const tradeId = `${trade.transactionHash}_${trade.timestamp}`;
+    
+    // 🔥 CRITICAL: Check for duplicates BEFORE processing
+    if (processedTradeIds.has(tradeId)) {
+      // Duplicate - skip silently
+      return;
+    }
+    
+    // Add to processed set
+    processedTradeIds.add(tradeId);
+    
+    // Limit set size to prevent memory leak
+    if (processedTradeIds.size > MAX_PROCESSED_HISTORY) {
+      // Remove oldest entries (convert to array, remove first 1000, convert back)
+      const arr = Array.from(processedTradeIds);
+      processedTradeIds.clear();
+      arr.slice(1000).forEach(id => processedTradeIds.add(id));
+    }
+    
     // Update stats
     stats.totalTrades++;
     stats.lastTradeAt = new Date();
 
     // Analyze wallet
-    const wallet = await walletAnalyzer.analyzeWallet(trade.proxyWallet);
+    let wallet;
+    try {
+      wallet = await walletAnalyzer.analyzeWallet(trade.proxyWallet);
+    } catch (walletError) {
+      console.error(`❌ Wallet API failed for trade #${stats.totalTrades}:`, walletError.message);
+      throw walletError;
+    }
 
     // Enrich market data (get end date)
-    const marketMetadata = await marketEnricher.getMarketMetadata(trade.eventSlug);
+    let marketMetadata;
+    try {
+      marketMetadata = await marketEnricher.getMarketMetadata(trade.eventSlug);
+    } catch (marketError) {
+      console.error(`❌ Market API failed for trade #${stats.totalTrades}:`, marketError.message);
+      throw marketError;
+    }
     
     // Add end date to trade
     trade.endDate = marketMetadata.endDate;
@@ -113,11 +157,16 @@ async function processTrade(trade: PolymarketTrade): Promise<void> {
     };
 
     io.emit('trade', message);
+    emittedToFrontend++;
 
     // Also broadcast updated stats in real-time
     io.emit('stats', {
       type: 'stats',
-      payload: { ...stats, uptime: Math.floor((Date.now() - startTime) / 1000) }
+      payload: { 
+        ...stats, 
+        uptime: Math.floor((Date.now() - startTime) / 1000),
+        lastPolymarketTradeAt: lastPolymarketTradeTime
+      }
     });
 
     // Log suspicious trades
@@ -125,7 +174,10 @@ async function processTrade(trade: PolymarketTrade): Promise<void> {
       console.log(`🚨 SUSPICIOUS: ${trade.proxyWallet.slice(0, 8)}... | $${tradeSizeUSD.toFixed(0)} | ${detection.confidence}`);
     }
   } catch (error) {
-    console.error('Error processing trade:', error);
+    console.error(`❌ Error processing trade #${stats.totalTrades}:`, error);
+    console.error(`   Wallet: ${trade.proxyWallet.slice(0, 10)}...`);
+    console.error(`   Market: ${trade.eventSlug}`);
+    // Don't throw - let other trades continue
   }
 }
 
@@ -163,7 +215,11 @@ io.on('connection', (socket) => {
   // Send current stats
   socket.emit('stats', {
     type: 'stats',
-    payload: { ...stats, uptime: Math.floor((Date.now() - startTime) / 1000) }
+    payload: { 
+      ...stats, 
+      uptime: Math.floor((Date.now() - startTime) / 1000),
+      lastPolymarketTradeAt: lastPolymarketTradeTime
+    }
   });
 
   socket.on('disconnect', () => {
@@ -178,12 +234,27 @@ io.on('connection', (socket) => {
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({
+  const uptime = Math.floor((Date.now() - startTime) / 1000);
+  const polymarketConnected = polymarketClient.getConnectionStatus();
+  const timeSinceLastTrade = lastPolymarketTradeTime 
+    ? Math.floor((Date.now() - lastPolymarketTradeTime.getTime()) / 1000)
+    : null;
+
+  const health = {
     status: 'ok',
-    uptime: Math.floor((Date.now() - startTime) / 1000),
-    polymarketConnected: polymarketClient.getConnectionStatus(),
-    stats
-  });
+    uptime,
+    polymarketConnected,
+    stats,
+    lastPolymarketTradeTime: lastPolymarketTradeTime?.toISOString() || 'never',
+    secondsSinceLastTrade: timeSinceLastTrade,
+    warning: timeSinceLastTrade && timeSinceLastTrade > 300 
+      ? '⚠️ No trades received for 5+ minutes - possible connection issue'
+      : null
+  };
+
+  console.log(`📊 Health check: Polymarket=${polymarketConnected}, Last trade=${timeSinceLastTrade}s ago`);
+
+  res.json(health);
 });
 
 // Get current stats
@@ -194,11 +265,47 @@ app.get('/stats', (req, res) => {
   });
 });
 
+// Diagnostic endpoint
+app.get('/diagnostics', (req, res) => {
+  const diagnostics = {
+    server: {
+      uptime: Math.floor((Date.now() - startTime) / 1000),
+      connectedClients: stats.connectedClients,
+      lastTradeAt: stats.lastTradeAt?.toISOString() || 'never',
+      lastPolymarketTradeAt: lastPolymarketTradeTime?.toISOString() || 'never'
+    },
+    polymarket: polymarketClient.getDiagnostics(),
+    stats: stats,
+    warnings: [] as string[]
+  };
+
+  // Check for issues
+  const timeSinceLastTrade = lastPolymarketTradeTime 
+    ? Math.floor((Date.now() - lastPolymarketTradeTime.getTime()) / 1000)
+    : null;
+
+  if (timeSinceLastTrade && timeSinceLastTrade > 300) {
+    diagnostics.warnings.push(`No trades received for ${timeSinceLastTrade}s - possible Polymarket connection issue`);
+  }
+
+  if (!polymarketClient.getConnectionStatus()) {
+    diagnostics.warnings.push('Polymarket WebSocket NOT connected');
+  }
+
+  console.log('🔍 Diagnostics requested:', diagnostics);
+  res.json(diagnostics);
+});
+
 /**
  * Initialize Polymarket connection
  */
 async function initializePolymarket(): Promise<void> {
-  polymarketClient.on('trade', processTrade);
+  polymarketClient.on('trade', (trade) => {
+    // Queue processing to prevent parallel execution
+    processingQueue = processingQueue.then(() => processTrade(trade)).catch(err => {
+      console.error('❌ Trade processing failed:', err);
+    });
+  });
 
   polymarketClient.on('connected', () => {
     console.log('✅ Polymarket stream active');
